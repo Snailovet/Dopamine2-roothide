@@ -27,6 +27,7 @@ jobs:
           # 切换到指定的commit
           cd ${{ github.workspace }}
           git checkout ${{ github.event.inputs.commit_sha || 'aa7b9ee47433becbacaacbb331395aa1a04e5454' }}
+          git submodule update --init --recursive
           
       - name: Install Procursus
         uses: dhinakg/procursus-action@main
