@@ -1,4 +1,4 @@
-name: "*** build tipa file ***"
+name: "*** build old tipa file ***"
 
 on:
   schedule:
@@ -61,7 +61,6 @@ jobs:
           set -x
           T2=$(TZ=UTC-2 date +'%Y%m%d_%H%M%S')
           TS=$(date -j -f "%Y%m%d_%H%M%S" "${T2}" +%s)
-          # 获取当前检出的commit的短SHA
           SHASH=$(git rev-parse --short HEAD)
           echo "ctime=${T2}" >> $GITHUB_ENV
           echo "ctimestamp=${TS}" >> $GITHUB_ENV
