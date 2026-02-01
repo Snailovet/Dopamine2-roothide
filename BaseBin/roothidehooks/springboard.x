@@ -8,7 +8,7 @@
 		char filePath[PATH_MAX];
 		if (fcntl(fildes, F_GETPATH, filePath) != -1) {
 			// Skip setting protection class on jailbreak apps, this doesn't work and causes snapshots to not be saved correctly
-			if (isSubPathOf(jbroot("/var/mobile/Library/SplashBoard/Snapshots/"), filePath)) {
+			if (isSubPathOf(filePath, jbroot("/var/mobile/Library/SplashBoard/Snapshots/"))) {
 				return 0;
 			}
 		}
@@ -71,7 +71,7 @@ static const void *kDenyQueryTagKey = &kDenyQueryTagKey;
 
 	if(tag && tag.boolValue) {
 
-		if([SENSITIVE_APP_LIST containsObject:bundleIdentifier]) {
+		if(is_sensitive_app_identifier(bundleIdentifier.UTF8String)) {
 			NSLog(@"FBSApplicationLibrary deny query %@", bundleIdentifier);
 			return nil;
 		}

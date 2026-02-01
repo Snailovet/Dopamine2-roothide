@@ -8,6 +8,7 @@
 #include <sandbox.h>
 #include <libproc.h>
 #include <xpc/xpc.h>
+#include <sys/proc.h>
 #include <sys/mount.h>
 #include <sys/proc_info.h>
 #include <dispatch/dispatch.h>
@@ -59,7 +60,7 @@ pid_t proc_get_ppid(pid_t pid)
 }
 
 // #define PROC_PIDPATHINFO_MAXSIZE        (4*MAXPATHLEN)
-char* proc_get_path(pid_t pid, char* buffer)
+char* proc_get_path(pid_t pid, char buffer[PATH_MAX])
 {
     static char __thread threadbuffer[PATH_MAX];
     if(!buffer) buffer = threadbuffer;
@@ -90,12 +91,38 @@ int proc_get_pidversion(pid_t pid)
 	return uniqidinfo.p_idversion;
 }
 
-/* Status values. */
-#define SIDL    1               /* Process being created by fork. */
-#define SRUN    2               /* Currently runnable. */
-#define SSLEEP  3               /* Sleeping on an address. */
-#define SSTOP   4               /* Process debugging or suspension. */
-#define SZOMB   5               /* Awaiting collection by parent. */
+char* proc_get_identifier(pid_t pid, char buffer[255])
+{
+    static char __thread threadbuffer[255];
+    if(!buffer) buffer = threadbuffer;
+    
+    struct csheader {
+        uint32_t magic;
+        uint32_t length;
+    } header = {0};
+    
+    int result = csops(pid, CS_OPS_IDENTITY, &header, sizeof(header));
+    if (result != 0 && errno != ERANGE) {
+        return NULL;
+    }
+    
+    uint32_t bufferLen = ntohl(header.length);
+
+    char* csbuffer = malloc(bufferLen);
+    if (!csbuffer) {
+        return NULL;
+    }
+    
+    result = csops(pid, CS_OPS_IDENTITY, csbuffer, bufferLen);
+    if (result == 0) {
+        char* identity = csbuffer + sizeof(struct csheader);
+        strlcpy(buffer, identity, 255);
+    }
+    
+    free(csbuffer);
+
+    return buffer;
+}
 
 int proc_paused(pid_t pid, bool* paused)
 {
@@ -125,6 +152,8 @@ int unrestrict(pid_t pid, int (*callback)(pid_t), bool resume)
 			return -1;
 		}
 		if(paused) {
+			//wait for process to be fully initialized (new task ipc enabling, csflags updating, etc.)
+			usleep(100*1000);
 			break;
 		}
         usleep(10*1000);
@@ -168,12 +197,11 @@ bool dyld_patch_enabled()
 
 int roothide_patch_proc(pid_t pid)
 {
-    if(!dyld_patch_enabled()) {
-        if(!process_force_dyld_patch(proc_get_path(pid,NULL), NULL)) {
-            return proc_patch_csflags(pid);
-        }
+    char path[PATH_MAX]={0};
+    if(dyld_patch_enabled() || process_force_dyld_patch(proc_get_path(pid,path), NULL)) {
+        return proc_patch_dyld(pid);
     }
-    return proc_patch_dyld(pid);
+    return proc_patch_csflags(pid);
 }
 
 int roothide_config_set_spinlock_fix(bool enabled)
@@ -183,7 +211,7 @@ int roothide_config_set_spinlock_fix(bool enabled)
         NSDictionary* attr = @{NSFilePosixPermissions:@(0755), NSFileOwnerAccountID:@(501), NSFileGroupOwnerAccountID:@(501)};
         if(![NSFileManager.defaultManager createDirectoryAtPath:roothideDir withIntermediateDirectories:YES attributes:attr error:nil])
         {
-            JBLogError("Failed to create directory: %@", roothideDir);
+            JBLogError("Failed to create directory: %s", roothideDir.fileSystemRepresentation);
             return -1;
         }
     }
@@ -193,7 +221,7 @@ int roothide_config_set_spinlock_fix(bool enabled)
     if(!defaults) defaults = [[NSMutableDictionary alloc] init];
     [defaults setValue:@(enabled) forKey:@"spinlockFixApplied"];
     if(![defaults writeToFile:configFilePath atomically:YES]) {
-        JBLogError("Failed to write config file: %@", configFilePath);
+        JBLogError("Failed to write config file: %s", configFilePath.fileSystemRepresentation);
         return -1;
     }
     return 0;
@@ -300,7 +328,7 @@ bool hasTrollstoreLiteMarker(const char* path)
 	return ret==0;
 }
 
-bool isSubPathOf(const char* parent, const char* child)
+bool isSubPathOf(const char* child, const char* parent)
 {
 	char real_child[PATH_MAX]={0};
 	char real_parent[PATH_MAX]={0};
@@ -336,10 +364,10 @@ void ensure_jbroot_symlink(const char* filepath)
 		strlcat(jbrootpath, "/", sizeof(jbrootpath));
 	}
 
-	JBLogDebug("%s : %s", realdirpath, jbrootpath);
-
-	if(strncmp(realdirpath, jbrootpath, strlen(jbrootpath)) != 0) 
+	if(strncmp(realdirpath, jbrootpath, strlen(jbrootpath)) != 0) {
+        JBLogDebug("ensure_jbroot_symlink skip path not inside jbroot: %s", realdirpath);
 		return;
+	}
 
 	struct stat jbrootst;
 	assert(stat(jbrootpath, &jbrootst) == 0);
@@ -400,12 +428,113 @@ char* generate_sandbox_extensions(audit_token_t *processToken, bool writable)
     return sandboxExtensionsOut;
 }
 
+struct sysctl_oid {
+	struct sysctl_oid_list *  oid_parent;
+	SLIST_ENTRY(sysctl_oid) oid_link;
+	int             oid_number;
+	int             oid_kind;
+	void            *oid_arg1;
+	int             oid_arg2;
+	const char      *oid_name;
+	int             (*oid_handler)();
+	const char      *oid_fmt;
+	const char      *oid_descr; /* offsetof() field / long description */
+	int             oid_version;
+	int             oid_refcnt;
+};
+
+void oid_remove(struct sysctl_oid_list* oid_parent, struct sysctl_oid* oid)
+{
+    JBLogDebug("oid_remove: %p %p \n", oid_parent, oid);
+    uint64_t pnext = UNSIGN_PTR((uint64_t)oid_parent);
+    while(true) {
+        uint64_t current = kread64(pnext);
+        if(!current) break;
+
+        struct sysctl_oid current_oid = {0};
+        kreadbuf(current, &current_oid, sizeof(current_oid));
+
+        char name[64]={0};
+        kreadbuf((uint64_t)current_oid.oid_name, &name, sizeof(name));
+        JBLogDebug("oid_remove: current_oid=%p number=%d name=%s\n", current, current_oid.oid_number, name);
+        
+        if(current == (uint64_t)oid) {
+            uint64_t next = (uint64_t)current_oid.oid_link.sle_next;
+            JBLogDebug("oid_remove: found@%p remove %p next->%p\n", pnext-gSystemInfo.kernelConstant.slide, current-gSystemInfo.kernelConstant.slide, next-gSystemInfo.kernelConstant.slide);
+            kwrite64(pnext, next);
+            break;
+        }
+
+        pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
+    }
+}
+void oid_insert(struct sysctl_oid_list* oid_parent, struct sysctl_oid* oid)
+{
+    JBLogDebug("oid_insert: %p %p \n", oid_parent, oid);
+
+    struct sysctl_oid insert_oid = {0};
+    kreadbuf((uint64_t)oid, &insert_oid, sizeof(insert_oid));
+
+    uint64_t pnext = UNSIGN_PTR((uint64_t)oid_parent);
+    while(true) {
+        uint64_t current = kread64(pnext);
+        if(!current) {
+            JBLogDebug("oid_insert: insert at end %p\n", pnext-gSystemInfo.kernelConstant.slide);
+            kwrite64((uint64_t)oid + offsetof(struct sysctl_oid, oid_link.sle_next), 0);
+            kwrite64(pnext, (uint64_t)oid);
+            break;
+        }
+
+        struct sysctl_oid current_oid = {0};
+        kreadbuf(current, &current_oid, sizeof(current_oid));
+
+        char name[64]={0};
+        kreadbuf((uint64_t)current_oid.oid_name, &name, sizeof(name));
+        JBLogDebug("oid_insert: current_oid=%p number=%d name=%s\n", current, current_oid.oid_number, name);
+        
+        if(insert_oid.oid_number < current_oid.oid_number) {
+            JBLogDebug("oid_insert: insert@%p before %p\n", pnext-gSystemInfo.kernelConstant.slide, current-gSystemInfo.kernelConstant.slide);
+            kwrite64((uint64_t)oid + offsetof(struct sysctl_oid, oid_link.sle_next), current);
+            kwrite64(pnext, (uint64_t)oid);
+            break;
+        }
+
+        pnext = current + offsetof(struct sysctl_oid, oid_link.sle_next);
+    }
+}
+
 void hideDeveloperMode()
 {
-    uint64_t launch_env_logging = kread64(ksymbol(launch_env_logging));
-    uint64_t developer_mode_status = kread64(ksymbol(developer_mode_status));
-    kwrite64(ksymbol(launch_env_logging), developer_mode_status);
-    kwrite64(ksymbol(developer_mode_status), launch_env_logging);
+    uint64_t developer_mode_status_oidp = ksymbol(developer_mode_status)-offsetof(struct sysctl_oid,oid_name);
+    uint64_t launch_env_logging_oidp = ksymbol(launch_env_logging)-offsetof(struct sysctl_oid,oid_name);
+
+    struct sysctl_oid developer_mode_status={0};
+    kreadbuf(developer_mode_status_oidp, &developer_mode_status, sizeof(developer_mode_status));
+
+    struct sysctl_oid launch_env_logging={0};
+    kreadbuf(launch_env_logging_oidp, &launch_env_logging, sizeof(launch_env_logging));
+
+    //detach
+    oid_remove(developer_mode_status.oid_parent, (struct sysctl_oid*)developer_mode_status_oidp);
+    oid_remove(launch_env_logging.oid_parent, (struct sysctl_oid*)launch_env_logging_oidp);
+
+    //reorder
+    kwrite32(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_number), (uint64_t)launch_env_logging.oid_number);
+    kwrite32(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_number), (uint64_t)developer_mode_status.oid_number);
+
+    //exchange data
+    kwrite64(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_name), (uint64_t)launch_env_logging.oid_name);
+    kwrite64(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_name), (uint64_t)developer_mode_status.oid_name);
+
+    kwrite64(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_descr), (uint64_t)launch_env_logging.oid_descr);
+    kwrite64(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_descr), (uint64_t)developer_mode_status.oid_descr);
+
+    kwrite32(developer_mode_status_oidp+offsetof(struct sysctl_oid,oid_kind), (uint64_t)launch_env_logging.oid_kind);
+    kwrite32(launch_env_logging_oidp+offsetof(struct sysctl_oid,oid_kind), (uint64_t)developer_mode_status.oid_kind);
+
+    //attach
+    oid_insert(developer_mode_status.oid_parent, (struct sysctl_oid*)developer_mode_status_oidp);
+    oid_insert(launch_env_logging.oid_parent, (struct sysctl_oid*)launch_env_logging_oidp);
 }
 
 int randomizeAndLoadBasebinTrustcache(const char* basebinPath)
@@ -419,6 +548,10 @@ int randomizeAndLoadBasebinTrustcache(const char* basebinPath)
     }
     for(NSURL* fileURL in directoryEnumerator)
     {
+        NSNumber* isFile = nil;
+        [fileURL getResourceValue:&isFile forKey:NSURLIsRegularFileKey error:nil];
+        if(!isFile || !isFile.boolValue) continue;
+
         cdhash_t cdhash={0};
         if(ensure_randomized_cdhash(fileURL.path.fileSystemRepresentation, cdhash) == 0) {
             basebins_cdhashes = realloc(basebins_cdhashes, (basebins_cdhashesCount+1) * sizeof(cdhash_t));
@@ -571,7 +704,10 @@ int exec_cmd_roothide_spawn(pid_t* pidp, const char* path, const posix_spawn_fil
             // will fail before launchdhook injected and dyld patched, eg: opainject...
             if(jbdSpawnPatchChild(pid, should_resume) != 0) {
                 JBLogError("Failed to patch spawned process (%d) %s", pid, path);
-                return 999;
+                //jailbreak internal spawn, just let it hang forever so that we could get a panic log
+                //kill(pid, SIGQUIT); //core dump
+                //kill(pid, SIGKILL);
+                return 202;
             }
         } else {
             if (should_resume) {
@@ -619,72 +755,153 @@ int ensure_dyld_trustcache(const char* path)
     return 0;
 }
 
-#define RB2_USERREBOOT (0x2000000000000000llu)
-void check_usreboot_msg(xpc_object_t xmsg)
+NSMutableArray<NSString*>* StoredAppIdentifiers = nil;
+
+void loadAppStoredIdentifiers()
 {
-	if(xpc_dictionary_get_uint64(xmsg, "flags") != RB2_USERREBOOT) {
-		return;
-	}
-	if(xpc_dictionary_get_uint64(xmsg, "type") != 1) {
-		return;
-	}
-	if(!xpc_dictionary_get_value(xmsg, "handle")
-     || xpc_dictionary_get_uint64(xmsg, "handle") != 0) {
-		return;
-	}
-	
-	if(getpid() != 1) {
-		JBLogError("usereboot message not from launchd?");
-		return;
-	}
+    StoredAppIdentifiers = [[NSMutableArray alloc] init];
 
-	audit_token_t clientToken = {0};
-	xpc_dictionary_get_audit_token(xmsg, &clientToken);
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSString *applicationsPath = @"/private/var/containers/Bundle/Application/";
+    
+    NSError *error = nil;
+    NSArray *appContainers = [fileManager contentsOfDirectoryAtPath:applicationsPath error:&error];
+    if (error) {
+        JBLogError("Error reading Application directory: %s", error.description.UTF8String);
+        abort();
+    }
+    
+    for (NSString *containerUUID in appContainers) 
+    {
+        NSString *containerPath = [applicationsPath stringByAppendingPathComponent:containerUUID];
 
-	if(audit_token_to_euid(clientToken) != 0) {
-		JBLogError("usereboot message not from root process?");
-		return;
-	}
+        NSString *metadataPlistPath = [containerPath stringByAppendingPathComponent:@".com.apple.mobile_container_manager.metadata.plist"];
+        NSDictionary *metadataPlist = [NSDictionary dictionaryWithContentsOfFile:metadataPlistPath];
+        NSString *MCMMetadataIdentifier = metadataPlist[@"MCMMetadataIdentifier"];
+        if(!MCMMetadataIdentifier) {
+            JBLogDebug("Skipping container with no MCMMetadataIdentifier: %s", containerPath.UTF8String);
+            continue;
+        }
 
-	struct statfs fsb={0};
-	if (statfs("/Developer", &fsb) != 0) {
-		JBLogError("unable to statfs /Developer, already broken?");
-		return;
-	}
+        if([fileManager fileExistsAtPath:[containerPath stringByAppendingPathComponent:@"_TrollStore"] isDirectory:NULL]
+            || [fileManager fileExistsAtPath:[containerPath stringByAppendingPathComponent:@"_TrollStoreLite"] isDirectory:NULL])
+        {
+            JBLogDebug("Skipping trollstored app container: %s : %s", MCMMetadataIdentifier.UTF8String, containerPath.UTF8String);
+            continue;
+        }
 
-	if(strcmp(fsb.f_mntonname, "/Developer") != 0) {
-		JBLogDebug("/Developer not mounted. skip");
-		return;
-	}
+        if(![fileManager fileExistsAtPath:[containerPath stringByAppendingPathComponent:@"iTunesMetadata.plist"] isDirectory:NULL])
+        {
+            JBLogDebug("Skipping non-stored app container: %s : %s", MCMMetadataIdentifier.UTF8String, containerPath.UTF8String);
+            continue;
+        }
 
-	// fix Xcode debugging being broken after the userspace reboot
-	// for iOS15 it is too late by the time launchd re-execs itself
+        NSArray *containerContents = [fileManager contentsOfDirectoryAtPath:containerPath error:nil];
+        for (NSString *item in containerContents)
+        {
+            if ([item hasSuffix:@".app"]) 
+            {
+                NSString *appPath = [containerPath stringByAppendingPathComponent:item];
+                NSString *infoPlistPath = [appPath stringByAppendingPathComponent:@"Info.plist"];
+                NSDictionary *infoPlist = [NSDictionary dictionaryWithContentsOfFile:infoPlistPath];
+                NSString *appBundleID = infoPlist[@"CFBundleIdentifier"];
 
-	int retval = unmount("/Developer", MNT_FORCE);
+                if([appBundleID isEqualToString:MCMMetadataIdentifier]==NO) {
+                    JBLogDebug("*** Mismatched Bundle ID and MCMMetadataIdentifier: %s != %s : %s", appBundleID.UTF8String, MCMMetadataIdentifier.UTF8String, appPath.UTF8String);
+                }
+                
+                if(![fileManager fileExistsAtPath:[appPath stringByAppendingPathComponent:@"SC_Info"] isDirectory:NULL])
+                {
+                    JBLogDebug("Skipping non-encrypted app: %s", appPath.UTF8String);
+                    continue;
+                }
 
-	if(retval != 0) {
-		JBLogError("unmount /Developer : %d %d,%s", retval, errno, strerror(errno));
-	}
+                if (appBundleID) {
+                    JBLogDebug("App: %s -> %s", item.UTF8String, appBundleID.UTF8String);
+                    [StoredAppIdentifiers addObject:appBundleID];
+                } else {
+                    JBLogDebug("*** No Bundle ID found: %s", appPath.UTF8String);
+                    continue;
+                }
+                
+                NSString *plugInsPath = [appPath stringByAppendingPathComponent:@"PlugIns"];
+                if ([fileManager fileExistsAtPath:plugInsPath]) 
+                {
+                    NSArray *plugIns = [fileManager contentsOfDirectoryAtPath:plugInsPath error:nil];
+                    for (NSString *plugIn in plugIns) 
+                    {
+                        NSString *plugInPath = [plugInsPath stringByAppendingPathComponent:plugIn];
+                        NSString *plugInInfoPath = [plugInPath stringByAppendingPathComponent:@"Info.plist"];
+                        NSDictionary *plugInInfo = [NSDictionary dictionaryWithContentsOfFile:plugInInfoPath];
+                        NSString *plugInBundleID = plugInInfo[@"CFBundleIdentifier"];
+                        
+                        if (plugInBundleID) {
+                            JBLogDebug("  PlugIn: %s -> %s", plugIn.UTF8String, plugInBundleID.UTF8String);
+                            [StoredAppIdentifiers addObject:plugInBundleID];
+                        } else {
+                            JBLogDebug("  *** No Bundle ID found: %s", plugInPath.UTF8String);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
-void roothide_handler_jbserver_msg(xpc_object_t xmsg)
+bool is_apple_internal_identifier(const char* identifier)
 {
-    check_usreboot_msg(xmsg);
+    if(!identifier || !*identifier) return false;
+    
+    for(NSString* item in APPLE_INTERNAL_IDENTIFIERS) {
+        if([@(identifier) hasPrefix:item]) {
+            return true;
+        }
+    }
+    return false;
+}
 
-#ifdef ENABLE_LOGS
+bool is_sensitive_app_identifier(const char* identifier)
+{
+    if(!identifier || !*identifier) return false;
 
-	if (!xpc_dictionary_get_value(xmsg, "jb-domain")) return;
-	if (!xpc_dictionary_get_value(xmsg, "action")) return;
+    for(NSString* item in SENSITIVE_APP_IDENTIFIERS) {
+        if([@(identifier) hasPrefix:item]) {
+            return true;
+        }
+    }
+    return false;
+}
 
-	audit_token_t clientToken = { 0 };
-	xpc_dictionary_get_audit_token(xmsg, &clientToken);
+bool is_safe_bundle_identifier(const char* identifier)
+{
+    if(!identifier || !*identifier) return false;
 
-    const char* desc = NULL;
-    JBLogDebug("jbserver received xpc message from (%d) %s :\n%s", 
-        audit_token_to_pid(clientToken), 
-        proc_get_path(audit_token_to_pid(clientToken),NULL), 
-        (desc=xpc_copy_description(xmsg)));
-    if(desc) free((void*)desc);
+    /* ios15 /System/Library/LaunchDaemons/com.apple.tvremoted.plist */
+    if(strcmp(identifier, "$(PRODUCT_BUNDLE_IDENTIFIER)")==0) {
+        return true;
+    }
 
-#endif
+    if(string_has_prefix(identifier, "lockdown.") && strstr(identifier, ".com.apple.")) {
+        return true;
+    }
+
+    if(string_has_prefix(identifier, "com.apple."))
+    {
+        if(is_apple_internal_identifier(identifier)) {
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    if(is_sensitive_app_identifier(identifier)) {
+        return false;
+    }
+
+    assert(StoredAppIdentifiers != nil);
+    if([StoredAppIdentifiers containsObject:@(identifier)]) {
+        return true;
+    }
+
+    return false;
 }

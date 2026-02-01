@@ -37,6 +37,11 @@ int sysctlbyname_hook(const char *name, void *oldp, size_t *oldlenp, void *newp,
 	return sysctlbyname_orig(name, oldp, oldlenp, newp, newlen);
 }
 
+extern xpc_object_t (*orig_xpc_dictionary_create_reply)(xpc_object_t original);
+extern xpc_object_t new_xpc_dictionary_create_reply(xpc_object_t original);
+extern int (*orig_xpc_pipe_routine_reply)(xpc_object_t reply);
+extern int new_xpc_pipe_routine_reply(xpc_object_t reply);
+
 void roothide_launchd_preinit()
 {
 	JBLogDebug("roothide_launchd_preinit");
@@ -115,14 +120,19 @@ void roothide_launchd_postinit(bool firstLoad)
 		}
 	}
 
+	loadAppStoredIdentifiers();
+
+	MSHookFunction(&xpc_dictionary_create_reply, (void*)new_xpc_dictionary_create_reply, &orig_xpc_dictionary_create_reply);
+	MSHookFunction(&xpc_pipe_routine_reply, (void*)new_xpc_pipe_routine_reply, &orig_xpc_pipe_routine_reply);
+
 	// load jailbreakd after applying hooks
 	assert(initJailbreakd(firstLoad) == 0);
 }
 
-extern int roothide_trust_executable_recurse(const char *executablePath, xpc_object_t preferredArchsArray);
+int roothide_trust_executable_recurse(const char *executablePath, const char *processWorkingDir, xpc_object_t preferredArchsArray);
 int roothide_launchd_trust_executable(const char* path)
 {
-	return dyld_patch_enabled() ? systemwide_trust_file_by_path(path) : roothide_trust_executable_recurse(path, NULL);
+	return dyld_patch_enabled() ? systemwide_trust_file_by_path(path) : roothide_trust_executable_recurse(path, "/", NULL);
 }
 
 int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *restrict path, struct _posix_spawn_args_desc *desc, char *const argv[restrict], char *const envp[restrict])
@@ -169,7 +179,13 @@ int roothide_launchd___posix_spawn_posthook(pid_t *restrict pidp, const char *re
 
 	if (ret == 0 && pid > 0) {
 		if(should_suspend) {
-			jbdSpawnPatchChild(pid, should_resume);
+			if(jbdSpawnPatchChild(pid, should_resume) != 0) {
+				JBLogError("Failed to patch spawned process (%d) %s", pid, path);
+				//just kill it instead of letting it hang forever so that launchd can respawn it later
+				kill(pid, SIGQUIT); //core dump
+				kill(pid, SIGKILL);
+				ret = 202;
+			}
 		}
 	} else {
 		JBLogError("spawn failed: %d %s, pid=%d", ret, strerror(ret), pid);
@@ -197,7 +213,13 @@ int roothide_launchd___posix_spawn__spinlock_fix_only(pid_t *restrict pidp, cons
 	posix_spawnattr_setflags(attrp, flags); // maybe caller will use it again?
 
 	if (ret == 0 && pid > 0) {
-		jbdSpinlockFixOnly(pid, should_resume);
+		if(jbdSpinlockFixOnly(pid, should_resume)  != 0) {
+			JBLogError("Failed to patch(spinlock fix) spawned process (%d) %s", pid, path);
+			//just kill it instead of letting it hang forever so that launchd can respawn it later
+			kill(pid, SIGQUIT); //core dump
+			kill(pid, SIGKILL);
+			ret = 202;
+		}
 	} else {
 		JBLogError("spawn failed: %d %s, pid=%d", ret, strerror(ret), pid);
 	}
@@ -243,11 +265,6 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 		if(access(roothidefile, F_OK) != 0) {
 			return EPERM;
 		}
-	}
-
-	if(launchdhookFirstLoad) {
-		//we should not enable system-wide injection until the jailbreak is finalized (userspace reboot).
-		return __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
 	}
 	
 	if(string_has_suffix(path, "/basebin/jailbreakd")) {
@@ -330,6 +347,12 @@ int roothide_launchd___posix_spawn_prehook(pid_t *restrict pidp, const char *res
 		return ret;
 	}
 
+	if(launchdhookFirstLoad) 
+	{
+		//we should not enable system-wide injection until the jailbreak is finalized (userspace reboot).
+		return __posix_spawn_orig_wrapper(pidp, path, desc, argv, envp);
+	}
+	
 	return __posix_spawn_hook(pidp, path, desc, argv, envp);
 }
 
