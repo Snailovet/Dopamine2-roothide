@@ -114,7 +114,7 @@ int spawnJailbreakd()
 			xpc_object_t xdict = NULL;
 			int err = xpc_pipe_receive(bootstraport, &xdict);
 			if(err == 0) {
-				/* xpchook will handle the jbcilent messages, should never go here */
+				abort(); /* xpchook should handle the jbclient messages, should never go here */
 				//jbserver_received_xpc_message(&gGlobalServer, xdict);
 				xpc_release(xdict);
 			}
@@ -424,13 +424,13 @@ int jbdExecTraceStart(const char* execfile, bool* traced)
 	return result;
 }
 
-int jbdExecTraceCancel(const char* execfile)
+int jbdExecTraceCancel(const char* execfile, bool* detached)
 {
 	xpc_object_t message = xpc_dictionary_create_empty();
 	xpc_dictionary_set_uint64(message, "id", JBD_MSG_EXEC_TRACE_CANCEL);
 
 	xpc_dictionary_set_string(message, "execfile", execfile);
-
+	xpc_dictionary_set_uint64(message, "detached", (uint64_t)(void*)detached);
 	xpc_object_t reply = jailbreakdXpcRequest(message);
 	xpc_release(message);
 
